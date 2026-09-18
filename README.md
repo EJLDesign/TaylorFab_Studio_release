@@ -30,9 +30,11 @@ The installer is strongly recommended (it writes the version-gated bundle manife
 1. Download the latest `.zip` from [Releases](https://github.com/EJLDesign/TaylorFab_Studio_release/releases/latest)
 2. Create folder `%APPDATA%\Autodesk\ApplicationPlugins\TaylorFabStudio.bundle\Contents\`
 3. Create `Contents\net8\` and `Contents\net10\`; into EACH, copy that flavor's `TaylorFabStudio.dll` plus a copy of `license.lic`, `EULA.txt`, and the `assets\` folder (the plugin resolves these beside the loaded DLL)
-4. Copy `Models\` to `Contents\Models\`
+4. Copy `Models\` to `Contents\Models\` — the plugin finds the model library there, beside its own flavor folder; it is not a setting and cannot be pointed anywhere else (the palette shows a red banner if it is missing)
 5. Copy a `PackageContents.xml` from a previous installer run (or run the installer once) — it gates `net8` to AutoCAD 2025/2026 and `net10` to 2027+
 6. Launch AutoCAD — the plugin loads automatically via the bundle
+
+Close AutoCAD before installing or upgrading: the installer refuses to run while the plugin is loaded, and never touches the previous install until the new one is complete.
 
 ## Usage
 

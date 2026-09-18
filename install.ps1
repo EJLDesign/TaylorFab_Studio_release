@@ -12,6 +12,11 @@
     AutoCAD 2024 and earlier are NOT supported by v10.0+ (they host .NET
     Framework, which cannot load these builds). The last release supporting
     AutoCAD 2024 is v9.x.
+
+    Close AutoCAD first: the installer refuses to run while the installed
+    plugin is loaded, and it never touches the previous install until the new
+    one has been downloaded, validated and staged in full (a failure at any
+    point leaves the previous version in place).
 .NOTES
     Run with: iex (irm https://raw.githubusercontent.com/EJLDesign/TaylorFab_Studio_release/main/install.ps1)
     Or: .\install.ps1
@@ -118,48 +123,112 @@ function Get-LatestRelease {
     }
 }
 
+# True when any plugin DLL under $dir is held open by another process (AutoCAD with the
+# plugin loaded). A locked DLL is what used to leave a half-deleted bundle behind: the old
+# installer removed the bundle FIRST, the delete got through Models\ / assets\ / net10\
+# and then died on the locked net8 DLL, and the next AutoCAD start loaded a plugin with
+# no model library (2026-09-18).
+function Test-PluginLocked([string]$dir) {
+    if (-not (Test-Path $dir)) { return $false }
+    $dlls = Get-ChildItem $dir -Filter "*.dll" -Recurse -File -ErrorAction SilentlyContinue
+    foreach ($dll in $dlls) {
+        try {
+            $fs = [System.IO.File]::Open($dll.FullName, 'Open', 'ReadWrite', 'None')
+            $fs.Close()
+        }
+        catch { return $true }
+    }
+    return $false
+}
+
 function Install-Plugin {
     param(
         [string]$DownloadUrl,
         [string]$TagName
     )
 
-    # Clean previous install (wait for the delete to actually finish --
-    # Windows deletes are async and antivirus handles can delay them)
+    # Refuse up front while AutoCAD holds the installed plugin: nothing is touched, the
+    # previous install keeps working, and the message says what to do.
     foreach ($dir in @($BundleDir, $LegacyBundleDir)) {
-        if (Test-Path $dir) {
-            Write-Host "  Removing previous installation at $dir..." -ForegroundColor Yellow
-            Remove-Item $dir -Recurse -Force
-            for ($i = 0; $i -lt 25 -and (Test-Path $dir); $i++) { Start-Sleep -Milliseconds 200 }
-            if (Test-Path $dir) {
-                throw "Could not remove the previous installation at '$dir'. Close AutoCAD and any Explorer windows in that folder, then run the installer again."
-            }
+        if (Test-PluginLocked $dir) {
+            $acad = @(Get-Process -Name acad -ErrorAction SilentlyContinue)
+            $hint = if ($acad.Count -gt 0) { "AutoCAD is running ($($acad.Count) window(s))." } else { "Another program has it open." }
+            throw "The installed plugin at '$dir' is in use. $hint Close AutoCAD completely, then run the installer again."
         }
     }
 
-    # Remove legacy per-product autoload registry entries (pre-rename BMFrameGenCAD).
-    # Leaving them would make AutoCAD try to load the deleted old DLL on startup.
-    Get-ChildItem "HKCU:\SOFTWARE\Autodesk\AutoCAD" -ErrorAction SilentlyContinue | ForEach-Object {
-        Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
-            foreach ($legacyName in @($LegacyPluginName)) {
-                $legacyKey = Join-Path $_.PSPath "Applications\$legacyName"
-                if (Test-Path $legacyKey) {
-                    Remove-Item $legacyKey -Recurse -Force -ErrorAction SilentlyContinue
-                    Write-Host "  Removed legacy autoload registry entry." -ForegroundColor Yellow
-                }
-            }
-            # Pre-v10 TaylorFabStudio entries point at the old single-DLL layout
-            # (Contents\TaylorFabStudio.dll) which no longer exists — Register-AutoLoad
-            # rewrites entries for detected versions, but stale entries for versions
-            # no longer installed would error at their next startup; drop them all.
-            $tfabKey = Join-Path $_.PSPath "Applications\$PluginName"
-            if (Test-Path $tfabKey) {
-                Remove-Item $tfabKey -Recurse -Force -ErrorAction SilentlyContinue
-            }
+    $pluginsRoot = Split-Path $BundleDir -Parent
+    New-Item -Path $pluginsRoot -ItemType Directory -Force | Out-Null
+
+    # Best-effort cleanup of debris from older runs (never reuse these paths --
+    # a failed delete or an antivirus handle on them must not break this run)
+    Get-ChildItem $env:TEMP -Filter "$PluginName-extract*" -Directory -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $env:TEMP -Filter "$PluginName-v*.zip" -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $pluginsRoot -Filter "TaylorFabStudio.bundle.*-*" -Directory -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Download and extract FIRST, using paths unique to this run so leftovers from a
+    # previous attempt (possibly still locked by antivirus) can't collide. The previous
+    # install is not touched until the new one is complete and verified below.
+    $runId = Get-Random
+    $tempZip = Join-Path $env:TEMP "$PluginName-$TagName-$runId.zip"
+    Write-Host "  Downloading $TagName..." -ForegroundColor Gray
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $tempZip -UseBasicParsing
+
+    # Extract with retries: antivirus scanners often hold just-written files
+    # briefly, which makes Expand-Archive fail spuriously
+    $tempExtract = Join-Path $env:TEMP "$PluginName-extract-$runId"
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
+            break
+        }
+        catch {
+            if ($attempt -ge 3) { throw }
+            Write-Host "  Extraction attempt $attempt failed (antivirus may be scanning); retrying..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 3
+            Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+            $tempExtract = Join-Path $env:TEMP "$PluginName-extract-$runId-$attempt"
         }
     }
 
-    New-Item -Path $ContentsDir -ItemType Directory -Force | Out-Null
+    # Validate the archive BEFORE anything is staged: the plugin resolves license.lic,
+    # EULA.txt and assets\ BESIDE the loaded DLL, so each flavor folder is self-contained
+    # (DLL + license + EULA + assets). The model library is shared: the plugin resolves
+    # Contents\Models from the loaded DLL's folder (Contents\net8 or Contents\net10) --
+    # it is not a setting and cannot be changed by the user.
+    $lic  = Get-ChildItem $tempExtract -Filter "license.lic" -Recurse | Select-Object -First 1
+    $eula = Get-ChildItem $tempExtract -Filter "EULA.txt" -Recurse | Select-Object -First 1
+    $assetsSource = Get-ChildItem $tempExtract -Directory -Filter "assets" -Recurse | Select-Object -First 1
+    $modelsSource = Get-ChildItem $tempExtract -Directory -Filter "Models" -Recurse | Select-Object -First 1
+    if (-not $modelsSource -or (Get-ChildItem $modelsSource.FullName -Filter "TaylorFab_*.dwg" -File).Count -eq 0) {
+        throw "The release archive has no model library (Models\TaylorFab_*.dwg). Nothing was changed -- report this release ($TagName)."
+    }
+    $flavorDlls = @{}
+    foreach ($flavor in @('net8', 'net10')) {
+        $dll = Get-ChildItem (Join-Path $tempExtract $flavor) -Filter "$PluginName.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($dll) { $flavorDlls[$flavor] = $dll } else { Write-Host "  WARNING: $flavor\$PluginName.dll not found in the release archive." -ForegroundColor Yellow }
+    }
+    if ($flavorDlls.Count -eq 0) {
+        throw "No plugin flavor found in the release archive (expected net8\ and net10\ folders). Nothing was changed."
+    }
+    if (-not $lic) {
+        Write-Host "  NOTE: No license.lic in release -- existing license (if any) stays in effect." -ForegroundColor Yellow
+    }
+    if (-not $assetsSource) {
+        Write-Host "  WARNING: No assets folder found in release -- sheet labels will not appear." -ForegroundColor Yellow
+    }
+
+    # Build the COMPLETE new bundle beside the live one (same volume, so the swap below is
+    # a rename), then swap. $newBundle/$oldBundle carry the run id so debris never collides;
+    # any failure while staging removes the staging folder and leaves the live install alone.
+    $newBundle   = "$BundleDir.new-$runId"
+    $oldBundle   = "$BundleDir.old-$runId"
+    $newContents = Join-Path $newBundle "Contents"
+    try {
+    New-Item -Path $newContents -ItemType Directory -Force | Out-Null
 
     # Write PackageContents.xml for AutoCAD bundle autoload. Two series-gated
     # components: AutoCAD picks the flavor matching its own engine series.
@@ -188,108 +257,99 @@ function Install-Plugin {
   </Components>
 </ApplicationPackage>
 "@
-    Set-Content (Join-Path $BundleDir "PackageContents.xml") $packageXml -Encoding UTF8
+    Set-Content (Join-Path $newBundle "PackageContents.xml") $packageXml -Encoding UTF8
 
-    # Best-effort cleanup of debris from older runs (never reuse these paths --
-    # a failed delete or an antivirus handle on them must not break this run)
-    Get-ChildItem $env:TEMP -Filter "$PluginName-extract*" -Directory -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    Get-ChildItem $env:TEMP -Filter "$PluginName-v*.zip" -File -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-
-    # Download and extract, using paths unique to this run so leftovers from a
-    # previous attempt (possibly still locked by antivirus) can't collide
-    $runId = Get-Random
-    $tempZip = Join-Path $env:TEMP "$PluginName-$TagName-$runId.zip"
-    Write-Host "  Downloading $TagName..." -ForegroundColor Gray
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $tempZip -UseBasicParsing
-
-    # Extract with retries: antivirus scanners often hold just-written files
-    # briefly, which makes Expand-Archive fail spuriously
-    $tempExtract = Join-Path $env:TEMP "$PluginName-extract-$runId"
-    for ($attempt = 1; ; $attempt++) {
-        try {
-            Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
-            break
-        }
-        catch {
-            if ($attempt -ge 3) { throw }
-            Write-Host "  Extraction attempt $attempt failed (antivirus may be scanning); retrying..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 3
-            Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
-            $tempExtract = Join-Path $env:TEMP "$PluginName-extract-$runId-$attempt"
-        }
-    }
-
-    # The plugin resolves license.lic, EULA.txt and assets\ BESIDE the loaded
-    # DLL, so each flavor folder is self-contained: DLL + license + EULA +
-    # assets. Only the model library is shared (referenced via settings).
-    $lic  = Get-ChildItem $tempExtract -Filter "license.lic" -Recurse | Select-Object -First 1
-    $eula = Get-ChildItem $tempExtract -Filter "EULA.txt" -Recurse | Select-Object -First 1
-    $assetsSource = Get-ChildItem $tempExtract -Directory -Filter "assets" -Recurse | Select-Object -First 1
-
-    $flavorsInstalled = 0
-    foreach ($flavor in @('net8', 'net10')) {
-        $dll = Get-ChildItem (Join-Path $tempExtract $flavor) -Filter "$PluginName.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $dll) {
-            Write-Host "  WARNING: $flavor\$PluginName.dll not found in the release archive." -ForegroundColor Yellow
-            continue
-        }
-        $flavorDir = Join-Path $ContentsDir $flavor
+    foreach ($flavor in $flavorDlls.Keys) {
+        $flavorDir = Join-Path $newContents $flavor
         New-Item -Path $flavorDir -ItemType Directory -Force | Out-Null
-        Copy-Item $dll.FullName -Destination $flavorDir
+        Copy-Item $flavorDlls[$flavor].FullName -Destination $flavorDir
 
         if ($lic)  { Copy-Item $lic.FullName  -Destination $flavorDir }
         if ($eula) { Copy-Item $eula.FullName -Destination $flavorDir }
         if ($assetsSource) {
             Copy-Item $assetsSource.FullName -Destination (Join-Path $flavorDir "assets") -Recurse
         }
-        Write-Host "  Installed $flavor flavor." -ForegroundColor Gray
-        $flavorsInstalled++
-    }
-    if ($flavorsInstalled -eq 0) {
-        throw "No plugin flavor found in the release archive (expected net8\ and net10\ folders)."
-    }
-    if (-not $lic) {
-        Write-Host "  NOTE: No license.lic in release -- existing license (if any) stays in effect." -ForegroundColor Yellow
-    }
-    if (-not $assetsSource) {
-        Write-Host "  WARNING: No assets folder found in release -- sheet labels will not appear." -ForegroundColor Yellow
+        Write-Host "  Staged $flavor flavor." -ForegroundColor Gray
     }
 
-    # Copy Models (shared between flavors; referenced via the settings file)
-    $modelsSource = Get-ChildItem $tempExtract -Directory -Filter "Models" -Recurse | Select-Object -First 1
-    if ($modelsSource) {
-        $modelsDest = Join-Path $ContentsDir "Models"
-        Copy-Item $modelsSource.FullName -Destination $modelsDest -Recurse
-        $modelCount = (Get-ChildItem $modelsDest -Filter "*.dwg").Count
-        Write-Host "  Installed $modelCount model files." -ForegroundColor Gray
+    # Models (shared between flavors, resolved by the plugin beside its own folder)
+    $modelsDest = Join-Path $newContents "Models"
+    Copy-Item $modelsSource.FullName -Destination $modelsDest -Recurse
+    $modelCount = (Get-ChildItem $modelsDest -Filter "*.dwg" -File).Count
+    if ($modelCount -eq 0) { throw "Copying the model library failed (0 files at '$modelsDest'). Nothing was changed." }
+    Write-Host "  Staged $modelCount model files." -ForegroundColor Gray
+
+    # Swap: the previous install is renamed aside (a rename is refused as a whole if anything
+    # inside is still open -- nothing is half-deleted), the new bundle takes its place, and
+    # the old one is removed best-effort. A failure here leaves the previous install in place.
+    if (Test-Path $BundleDir) {
+        Write-Host "  Replacing previous installation..." -ForegroundColor Yellow
+        try { Rename-Item -Path $BundleDir -NewName (Split-Path $oldBundle -Leaf) -ErrorAction Stop }
+        catch {
+            throw "Could not replace the previous installation at '$BundleDir' (it is in use). Close AutoCAD and any Explorer windows in that folder, then run the installer again. The previous version is still installed."
+        }
+        # Even if the old copy cannot be fully removed below, it must never look like a
+        # bundle to AutoCAD (the folder name no longer ends in .bundle; this is belt and braces).
+        Remove-Item (Join-Path $oldBundle "PackageContents.xml") -Force -ErrorAction SilentlyContinue
     }
-    else {
-        Write-Host "  WARNING: No Models folder found in release." -ForegroundColor Yellow
+    try { Rename-Item -Path $newBundle -NewName (Split-Path $BundleDir -Leaf) -ErrorAction Stop }
+    catch {
+        # Put the old one back so the machine is never left without a plugin.
+        if (Test-Path $oldBundle) { Rename-Item -Path $oldBundle -NewName (Split-Path $BundleDir -Leaf) -ErrorAction SilentlyContinue }
+        throw "Could not move the new installation into place: $_  The previous version was restored."
+    }
+    }
+    catch {
+        Remove-Item $newBundle -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    if (Test-Path $oldBundle) {
+        Remove-Item $oldBundle -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $oldBundle) { Write-Host "  NOTE: the previous version's folder could not be fully removed ($oldBundle); it is inert and will be cleaned up next run." -ForegroundColor Yellow }
+    }
+    if (Test-Path $LegacyBundleDir) {
+        Write-Host "  Removing legacy installation at $LegacyBundleDir..." -ForegroundColor Yellow
+        Remove-Item $LegacyBundleDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # Write model library path to settings. Migrate the pre-rename settings file
-    # first so users keep their LED/elevation/tower preferences across the rename.
+    # Remove legacy per-product autoload registry entries (pre-rename BMFrameGenCAD).
+    # Leaving them would make AutoCAD try to load the deleted old DLL on startup.
+    Get-ChildItem "HKCU:\SOFTWARE\Autodesk\AutoCAD" -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
+            foreach ($legacyName in @($LegacyPluginName)) {
+                $legacyKey = Join-Path $_.PSPath "Applications\$legacyName"
+                if (Test-Path $legacyKey) {
+                    Remove-Item $legacyKey -Recurse -Force -ErrorAction SilentlyContinue
+                    Write-Host "  Removed legacy autoload registry entry." -ForegroundColor Yellow
+                }
+            }
+            # Pre-v10 TaylorFabStudio entries point at the old single-DLL layout
+            # (Contents\TaylorFabStudio.dll) which no longer exists — Register-AutoLoad
+            # rewrites entries for detected versions, but stale entries for versions
+            # no longer installed would error at their next startup; drop them all.
+            $tfabKey = Join-Path $_.PSPath "Applications\$PluginName"
+            if (Test-Path $tfabKey) {
+                Remove-Item $tfabKey -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Settings: migrate the pre-rename file so users keep their LED/elevation/tower
+    # preferences across the rename. The model library is NOT a setting any more (the
+    # plugin resolves Contents\Models beside its own folder); a LibraryPath line left by
+    # an older installer is ignored by the plugin -- drop it so nobody is misled by it.
     $settingsFile = Join-Path $env:APPDATA "taylorfabstudio_settings.txt"
     $legacySettings = Join-Path $env:APPDATA "bmframegen_settings.txt"
     if (-not (Test-Path $settingsFile) -and (Test-Path $legacySettings)) {
         Copy-Item $legacySettings $settingsFile
         Write-Host "  Migrated settings from bmframegen_settings.txt." -ForegroundColor Gray
     }
-    $modelsPath = Join-Path $ContentsDir "Models"
     if (Test-Path $settingsFile) {
-        $content = Get-Content $settingsFile -Raw
-        if ($content -match "(?m)^LibraryPath=") {
-            $content = $content -replace "(?m)^LibraryPath=.*$", "LibraryPath=$modelsPath"
+        try {
+            $kept = @(Get-Content $settingsFile | Where-Object { $_ -notmatch '^LibraryPath=' })
+            Set-Content $settingsFile $kept
         }
-        else {
-            $content = "LibraryPath=$modelsPath`n$content"
-        }
-        Set-Content $settingsFile $content -NoNewline
-    }
-    else {
-        Set-Content $settingsFile "LibraryPath=$modelsPath"
+        catch { Write-Host "  NOTE: could not tidy $settingsFile ($_) -- harmless." -ForegroundColor Yellow }
     }
 
     # Clean up temp files
@@ -349,12 +409,14 @@ function Test-Installation {
         }
     }
 
-    # Check Models
+    # Check Models -- the plugin cannot generate without it, so this is a FAIL, not a warning.
     $modelsPath = Join-Path $ContentsDir "Models"
-    if ((Test-Path $modelsPath) -and (Get-ChildItem $modelsPath -Filter "*.dwg").Count -gt 0) {
-        Write-Host "  [OK] Model library installed" -ForegroundColor Green
+    $modelCount = if (Test-Path $modelsPath) { (Get-ChildItem $modelsPath -Filter "TaylorFab_*.dwg" -File).Count } else { 0 }
+    if ($modelCount -gt 0) {
+        Write-Host "  [OK] Model library installed ($modelCount frame/post files)" -ForegroundColor Green
     } else {
-        Write-Host "  [WARN] Model library missing or empty" -ForegroundColor Yellow
+        Write-Host "  [FAIL] Model library missing or empty at $modelsPath -- the plugin will refuse to generate" -ForegroundColor Red
+        $ok = $false
     }
 
     # Check registry entries
@@ -367,14 +429,6 @@ function Test-Installation {
             Write-Host "  [FAIL] Registry entry missing for $($acad.Name)" -ForegroundColor Red
             $ok = $false
         }
-    }
-
-    # Check settings
-    $settingsFile = Join-Path $env:APPDATA "taylorfabstudio_settings.txt"
-    if (Test-Path $settingsFile) {
-        Write-Host "  [OK] Settings configured" -ForegroundColor Green
-    } else {
-        Write-Host "  [WARN] Settings file not found" -ForegroundColor Yellow
     }
 
     return $ok
